@@ -1,0 +1,13 @@
+<RCC>
+    <qresource prefix="/materials"/>
+    <qresource prefix="/">
+        <file>images/OpenFile.png</file>
+        <file>images/OpenURL.png</file>
+        <file>fragment.fsh</file>
+        <file>vertex.vsh</file>
+        <file>images/pause.jpg</file>
+        <file>images/start.jpg</file>
+        <file>images/stop.jpg</file>
+        <file>images/fileSave.png</file>
+    </qresource>
+</RCC>

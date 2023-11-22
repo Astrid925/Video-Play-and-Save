@@ -1,0 +1,323 @@
+#include "realTimePlay.h"
+#include <qdatetime.h>
+#include <QDebug>
+
+realTimePlay::realTimePlay(QObject *parent ):
+    QObject(parent)
+{
+    m_qstrRtspURL = "";
+    m_qstrOutPutFile = "";
+
+
+}
+
+realTimePlay::~realTimePlay()
+{
+    close();      // 放置有些应用不调用close()
+
+}
+
+void realTimePlay::getRtspURL(QString strRtspURL)
+{
+    this->m_qstrRtspURL = strRtspURL;
+}
+
+void realTimePlay::getOutURL(QString strRute)
+{
+    this->m_qstrOutPutFile = strRute;
+}
+
+bool realTimePlay::open()
+{
+    if(m_qstrRtspURL.isNull())
+    {
+        qDebug(" input url or outFile is null,===========keep trying \n");
+        return false;
+    }
+
+    AVDictionary *options = nullptr;  // AVDictionary是键对存储工具
+    av_dict_set(&options,"rtsp_transport", "tcp", 0); // 添加key-value对
+    av_dict_set(&options, "max_delay", "3", 0);
+    av_dict_set(&options,"timeout","10000000",0);
+    av_dict_set(&options, "buffer_size", "1024000", 0);// 设置“buffer_size”缓存容量
+
+    // 1.打开输入流并返回解封装上下文
+    int nRet = avformat_open_input(&m_pInFmtCtx,               // 返回解封装上下文
+                                  m_qstrRtspURL.toStdString().c_str(),  // 打开视频地址
+                                  nullptr,                   // 如果非null，此参数强制使用特定的输入格式。自动选择解封装器（文件格式）
+                                  &options);                    // 参数设置
+    if(options)
+    {
+        av_dict_free(&options); // 释放参数字典
+    }
+    if( nRet < 0)
+    {
+        qDebug("Fail to open input url,===========keep trying \n");
+        return false;
+    }
+
+    // 2.读取媒体文件的数据包以获取流信息。
+    nRet=avformat_find_stream_info(m_pInFmtCtx, nullptr);
+    if( nRet < 0)
+    {
+        qDebug("Fail to find the video stream information .\n");
+        return false;
+    }
+
+    // 3.通过AVMediaType枚举查询视频流ID（也可以通过遍历查找），最后一个参数无用
+    nVideo_indx = av_find_best_stream(m_pInFmtCtx,AVMEDIA_TYPE_VIDEO,-1,-1,nullptr,0);
+    if(nVideo_indx < 0)
+    {
+        avformat_free_context(m_pInFmtCtx);
+        qDebug("Fail to find a video stream.\n");
+        return false;
+    }
+   // 4.通过解码器ID获取视频解码器
+   const AVCodec *pInCodec = avcodec_find_decoder(m_pInFmtCtx->streams[nVideo_indx]->codecpar->codec_id);
+   if( pInCodec==nullptr)
+   {
+       qDebug("Fail to find a decoder.\n");
+       return false;
+   }
+   //5.获取解码器上下文
+   pInCodecCtx = avcodec_alloc_context3(pInCodec);
+   if(!pInCodecCtx)
+   {
+        qDebug("Fail to create the context of decoder.\n");
+       return false;
+   }
+
+   //6.复制解码器参数, 使用视频流的codecpar为解码器上下文赋值
+   nRet = avcodec_parameters_to_context(pInCodecCtx, m_pInFmtCtx->streams[nVideo_indx]->codecpar);
+   if(nRet < 0)
+   {
+       avcodec_free_context(&pInCodecCtx);
+       qDebug("Fail to copy the parameters.\n");
+       return false;
+   }
+
+   //7.打开解码器
+   nRet=avcodec_open2(pInCodecCtx, nullptr, nullptr);
+   if(nRet < 0)
+   {
+       avcodec_free_context(&pInCodecCtx);
+       qDebug("Error: Can't open decoder!\n");
+       return false;
+   }
+
+   // 分配空间
+   packet = av_packet_alloc();
+   pFrame= av_frame_alloc();
+   cPacketData = new char(pInCodecCtx->extradata_size  * sizeof(char*));
+   cExtradata = (uint8_t *)malloc((100000) * sizeof(uint8_t));
+
+   // 打开输出文件并写入头文件
+   setOutputCtx( pInCodecCtx,&m_pTsFmtCtx);
+   //
+   m_End=false;
+   return true;
+}
+
+AVFrame* realTimePlay::read()    //读取一帧图像
+{
+    if(!m_pInFmtCtx) // 如果没有打开媒体文件
+    {
+        return nullptr;
+    }
+
+   // 读取帧数据
+    int readRet=av_read_frame(m_pInFmtCtx, packet);
+    if (readRet<0)
+    {
+        m_End=true;
+        return nullptr;
+    }
+    else
+    {
+       if (packet->stream_index == nVideo_indx)
+       {
+          if(m_pTsFmtCtx && m_saveFile)
+          {
+            if(!firstKeyFrame)
+            {
+                if((packet->flags&AV_PKT_FLAG_KEY))  // 找到关键帧
+                   {
+                        cPacketData=(char*)packet->data;
+                        qint64 n=0;
+                        while((char*)packet->data)   // 在关键帧前加入SPS、PPS数据
+                        {
+                            if(cPacketData[n] == 0 && cPacketData[n + 1] == 0 && cPacketData[n + 2] == 0 && cPacketData[n + 3] == 1 && cPacketData[n + 4] == 101)
+                            {
+                                memcpy(cExtradata,pInCodecCtx->extradata,pInCodecCtx->extradata_size);
+                                memcpy(cExtradata+pInCodecCtx->extradata_size,packet->data,packet->size);
+                                packet->size+=pInCodecCtx->extradata_size;
+                                packet->data=cExtradata;
+                                firstKeyFrame=true;
+                                //qDebug()<<"成功加入SPS、PPS数据!"<<endl;
+                                break;
+                            }
+                            if(n==packet->size)
+                            {
+                                break;
+                            }
+                            cPacketData++;
+                            n++;
+                        }
+                    }
+                packet->stream_index=0;
+                av_write_frame(m_pTsFmtCtx, packet); // 将数据包写入输出文件
+            }
+
+            else
+            {
+                packet->stream_index=0;
+                av_write_frame(m_pTsFmtCtx, packet); // 将数据包写入输出文件
+            }
+
+          }
+          m_obtainFrames++;
+          AVStream* in_stream = m_pInFmtCtx->streams[nVideo_indx];
+          AVRational in_time_base1 = in_stream->time_base;
+          //Duration between 2 frames (us)
+          int64_t in_duration = (double)AV_TIME_BASE / av_q2d(in_stream->r_frame_rate);
+          packet->pts = (double)(( m_obtainFrames*in_duration) / (double)(av_q2d(in_time_base1)*AV_TIME_BASE))/1000; // 转换为ms
+          //qDebug("帧数的pts：%i",packet->pts);
+
+          if(avcodec_send_packet(pInCodecCtx, packet)<0)
+          {
+               qDebug("The input is to end.\n");
+               return nullptr;
+          }
+       }
+      av_packet_unref(packet);
+      int got_picture = avcodec_receive_frame(pInCodecCtx, pFrame);//把解码好的YUV数据放到pFrame中
+       m_pts=pFrame->pts;
+      if(0 == got_picture)//解码好一帧数据
+      {
+
+         return pFrame;
+      }
+      else
+      {
+          av_frame_unref(pFrame);
+          return nullptr;
+      }
+    }
+}
+
+void realTimePlay::close()
+{
+    if(m_pTsFmtCtx && m_writeHeader)
+    {
+        av_write_trailer(m_pTsFmtCtx);  //写入文件尾
+
+        avformat_free_context(m_pTsFmtCtx);
+    }
+
+    if(m_pInFmtCtx && m_pInFmtCtx->pb)
+    {
+        avio_flush(m_pInFmtCtx->pb);
+        avformat_free_context(m_pInFmtCtx);
+        avcodec_free_context(&pInCodecCtx);
+        av_packet_free(&packet);
+        av_frame_free(&pFrame);
+
+    }
+    delete cPacketData;
+    free(cExtradata);
+
+    m_qstrRtspURL = "";
+    m_qstrOutPutFile = "";
+    m_pInFmtCtx = nullptr;
+    m_pTsFmtCtx  = nullptr;
+
+    nVideo_indx=0;
+    pInCodecCtx = nullptr;
+    packet = nullptr;
+    pFrame = nullptr;
+
+    encCtx = nullptr;
+    out_stream = nullptr;
+    m_End=false;
+    m_writeHeader=false;
+    m_obtainFrames=0 ;  // 视频当前获取到的帧数
+    m_pts = 0;
+
+    m_saveFile=false;
+    cPacketData= nullptr;
+    cExtradata = nullptr;
+    firstKeyFrame=false;
+}
+
+bool realTimePlay::isEnd()  //
+{
+    return m_End;
+}
+
+qint64 realTimePlay::pts()
+{
+    return m_pts;
+}
+
+void realTimePlay::saveFile(bool saveFlag)
+{
+    m_saveFile=saveFlag;
+
+}
+
+bool realTimePlay::setOutputCtx(AVCodecContext *encCtx, AVFormatContext **pTsFmtCtx) // 配置输出文件的上下文
+{
+    if( m_qstrOutPutFile.isNull())
+    {
+        qDebug("outFile is null,===========keep trying \n");
+        return false;
+    }
+
+    QString strTime = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss");
+    QString strName = m_qstrOutPutFile+"\\"+ strTime+".264";
+   // qDebug()<<"文件名为："<<strName<<endl;
+
+    avformat_alloc_output_context2(pTsFmtCtx , nullptr, nullptr,  strName.toStdString().c_str()); // avformat_alloc_output_context2()函数可以初始化一个用于输出的AVFormatContext结构体
+    if (!pTsFmtCtx )
+    {
+        qDebug("Could not create output context\n");
+        return false;
+    }
+
+    // 创建并初始化AVIOContext以访问url所指示的资源。
+    if (avio_open(&((*pTsFmtCtx)->pb), strName.toStdString().c_str(), AVIO_FLAG_READ_WRITE) < 0) // avio_open()用于打开FFmpeg的输入输出文件,pb是AVFormatContext的结构体的成员 AVIOContext*pb 输入数据的缓存
+    {
+        avformat_free_context(*pTsFmtCtx); // AVFrameContext结构体销毁函数
+        qDebug("Fail to open out file.\n");
+       return false;
+    }
+    // 向媒体文件添加新流
+    out_stream = avformat_new_stream(*pTsFmtCtx,nullptr); //AVStream 是流通道，建立码流通道（e.g.，H264码流通道）； avformat_new_stream()创建stream通道；condec 是AVCodecContext结构体的成员，采用的解码器AVCodec（H.264,MPEG2..）
+   // 拷贝编码参数
+    if(avcodec_parameters_from_context(out_stream->codecpar, encCtx)<0)
+    {
+        qDebug("Fail to copy the parameters of decoder.\n");
+        return false;
+    }
+    // 写入头文件
+    if (avformat_write_header(m_pTsFmtCtx, nullptr)<0)
+    {
+        avformat_free_context(m_pTsFmtCtx);
+        qDebug("Fail to write the header for outFile.\n");
+        return false;
+    }
+
+    m_writeHeader=true;
+    return true;
+}
+
+qreal realTimePlay::rationalToDouble(AVRational* rational)
+{
+    qreal num = (rational->den == 0) ? 0 : (qreal(rational->num) / rational->den);
+    return num;
+}
+
+
+
+
+
